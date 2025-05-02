@@ -7,85 +7,128 @@
 // @match        *://*/*
 // @namespace https://greasyfork.org/users/385149
 // ==/UserScript==
- 
+
 (function () {
     'use strict';
- 
-    const cloudName = 'Cloud Name';              // ← 替换为你的 Cloud Name
+
+    const cloudName = 'Cloudinary Cloud Name';              // ← 替换为你的 Cloudinary Cloud Name
     const uploadPreset = 'tampermonkey_upload';      // ← 替换为你的 Upload Preset
-    /*
-    创建一个 Unsigned Upload Preset（推荐方式）
-    这样就能用上面那个油猴脚本，无需暴露 API Secret，安全可靠。
- 
-    具体步骤：
-    登录 Cloudinary 控制台：https://cloudinary.com/console
- 
-    左侧点击：Settings（设置）
- 
-    点击上方的 Upload 标签
- 
-    下拉找到 Upload presets
- 
-    点击 Add upload preset
- 
-    设置如下：
- 
-    Name: 比如 tampermonkey_upload
- 
-    Signing Mode: 选择 Unsigned
- 
-    可选配置：允许图片类型、最大大小等
- 
-    保存后你就有了一个 upload_preset 名称
-    */
- 
-    let currentImageURL = null;
- 
-    // 监听图片点击，记录当前选中的图片 URL
+
+    let selectedElement = null;
+
+    // 捕获用户点击的元素
     document.addEventListener('click', (e) => {
-        const target = e.target;
-        if (target.tagName === 'IMG') {
-            currentImageURL = target.src;
-            console.log('[Cloudinary] 选中图片:', currentImageURL);
-        }
+        selectedElement = e.target;
+        console.log('[Cloudinary] 选中元素:', selectedElement);
     });
- 
+
     // 注册右键菜单命令
-    GM_registerMenuCommand('上传选中图片到 Cloudinary', () => {
-        if (!currentImageURL) {
-            alert('请先点击一张图片以选中它。');
+    GM_registerMenuCommand('上传选中图片到 Cloudinary', async () => {
+        if (!selectedElement) {
+            alert('请先点击一张图片或含图的元素。');
             return;
         }
- 
-        uploadImageToCloudinary(currentImageURL);
+
+        try {
+            const blob = await getImageBlob(selectedElement);
+            if (!blob) throw new Error('无法识别或提取图片');
+
+            await uploadBlobToCloudinary(blob);
+        } catch (err) {
+            alert('❌ 错误：' + err.message);
+        }
     });
- 
-    function uploadImageToCloudinary(imageUrl) {
+
+    // 判断并提取图片 Blob
+    async function getImageBlob(el) {
+        // 1. <img>
+        if (el.tagName === 'IMG' && el.src) {
+            return fetchToBlob(el.src);
+        }
+
+        // 2. picture > img
+        if (el.tagName === 'PICTURE') {
+            const img = el.querySelector('img');
+            if (img?.src) return fetchToBlob(img.src);
+        }
+
+        // 3. background-image
+        const bg = getComputedStyle(el).backgroundImage;
+        const bgUrlMatch = bg?.match(/url\(["']?(.*?)["']?\)/);
+        if (bgUrlMatch && bgUrlMatch[1]) {
+            return fetchToBlob(bgUrlMatch[1]);
+        }
+
+        // 4. <canvas>
+        if (el.tagName === 'CANVAS') {
+            const dataUrl = el.toDataURL('image/png');
+            return dataURLtoBlob(dataUrl);
+        }
+
+        // 5. <svg>
+        if (el.tagName === 'SVG' || el instanceof SVGElement) {
+            const svgData = new XMLSerializer().serializeToString(el);
+            const svgBlob = new Blob([svgData], { type: 'image/svg+xml' });
+
+            // 用 Canvas 转成 PNG
+            const imgUrl = URL.createObjectURL(svgBlob);
+            const pngBlob = await svgToPngBlob(imgUrl);
+            URL.revokeObjectURL(imgUrl);
+            return pngBlob;
+        }
+
+        return null;
+    }
+
+    // 上传图片 Blob 到 Cloudinary
+    async function uploadBlobToCloudinary(blob) {
         const apiUrl = `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`;
- 
-        fetch(imageUrl)
-            .then(res => res.blob())
-            .then(blob => {
-                const formData = new FormData();
-                formData.append('file', blob);
-                formData.append('upload_preset', uploadPreset);
- 
-                return fetch(apiUrl, {
-                    method: 'POST',
-                    body: formData
-                });
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.secure_url) {
-                    GM_setClipboard(data.secure_url);
-                    alert(`✅ 上传成功！链接已复制：\n${data.secure_url}`);
-                } else {
-                    throw new Error(data.error?.message || '上传失败，未知错误');
-                }
-            })
-            .catch(err => {
-                alert('❌ 上传失败：' + err.message);
-            });
+        const formData = new FormData();
+        formData.append('file', blob);
+        formData.append('upload_preset', uploadPreset);
+
+        const res = await fetch(apiUrl, { method: 'POST', body: formData });
+        const data = await res.json();
+
+        if (data.secure_url) {
+            GM_setClipboard(data.secure_url);
+            alert(`✅ 上传成功：\n${data.secure_url}`);
+            window.open(data.secure_url, '_blank');
+        } else {
+            throw new Error(data.error?.message || '上传失败');
+        }
+    }
+
+    // URL 转 blob
+    function fetchToBlob(url) {
+        return fetch(url).then(res => res.blob());
+    }
+
+    // dataURL 转 blob
+    function dataURLtoBlob(dataurl) {
+        const arr = dataurl.split(',');
+        const mime = arr[0].match(/:(.*?);/)[1];
+        const bstr = atob(arr[1]);
+        let n = bstr.length;
+        const u8arr = new Uint8Array(n);
+        while (n--) u8arr[n] = bstr.charCodeAt(n);
+        return new Blob([u8arr], { type: mime });
+    }
+
+    // svg blob url → png blob
+    function svgToPngBlob(svgUrl) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob(resolve, 'image/png');
+            };
+            img.onerror = reject;
+            img.src = svgUrl;
+        });
     }
 })();
